@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube Dual Subtitles
 // @namespace    http://tampermonkey.net/
-// @version      1.1
+// @version      1.2
 // @description  Show English and Chinese subtitles together on YouTube
 // @author       Vinh Nguyen
 // @match        https://www.youtube.com/watch*
@@ -19,9 +19,18 @@
     };
 
     let cleanupCurrentVideo = () => {};
+    let initializationTimer = null;
+    let initializationGeneration = 0;
+    let activeAbortController = null;
 
     function pause(milliseconds) {
         return new Promise((resolve) => setTimeout(resolve, milliseconds));
+    }
+
+    function throwIfAborted(signal) {
+        if (signal.aborted) {
+            throw new DOMException("Subtitle loading was superseded", "AbortError");
+        }
     }
 
     function getCaptionRenderer(player) {
@@ -83,7 +92,7 @@
 
     // Returns a recent timedtext request containing the PO token. YouTube's
     // caption-track baseUrl is still used for the actual track selection.
-    async function extractTimedTextUrl(maxRetries = 5) {
+    async function extractTimedTextUrl(signal, maxRetries = 5) {
         const subtitleButton = document.querySelector(".ytp-subtitles-button");
         if (!subtitleButton) {
             throw new Error("Subtitle button not found");
@@ -92,12 +101,14 @@
         const videoId = new URL(location.href).searchParams.get("v");
         let retries = maxRetries;
         while (retries > 0) {
+            throwIfAborted(signal);
             console.log(`Trying to find timedtext URL. Try ${maxRetries - retries + 1}/${maxRetries}`);
 
             // Toggling twice preserves the current state and triggers a caption request.
             subtitleButton.click();
             subtitleButton.click();
             await pause(500);
+            throwIfAborted(signal);
 
             const entries = performance.getEntriesByType("resource").slice().reverse();
             for (const entry of entries) {
@@ -159,13 +170,16 @@
             .filter((cue) => Number.isFinite(cue.start) && Number.isFinite(cue.end) && cue.text);
     }
 
-    async function fetchSubtitleCues(authenticatedUrl, candidate) {
+    async function fetchSubtitleCues(authenticatedUrl, candidate, signal) {
         const subtitleUrl = buildSubtitleUrl(
             authenticatedUrl,
             candidate.sourceTrack,
             candidate.translatedLanguage,
         );
-        const response = await fetch(subtitleUrl, { credentials: "include" });
+        const response = await fetch(subtitleUrl, {
+            credentials: "include",
+            signal,
+        });
         if (!response.ok) {
             throw new Error(`HTTP ${response.status}`);
         }
@@ -240,14 +254,16 @@
         ));
     }
 
-    async function resolveSubtitleLanguage(authenticatedUrl, candidates, family) {
+    async function resolveSubtitleLanguage(authenticatedUrl, candidates, family, signal) {
         const failures = [];
         for (const candidate of candidates) {
+            throwIfAborted(signal);
             try {
-                const cues = await fetchSubtitleCues(authenticatedUrl, candidate);
+                const cues = await fetchSubtitleCues(authenticatedUrl, candidate, signal);
                 console.log(`Loaded ${family} subtitles: ${candidate.description}`);
                 return { cues, description: candidate.description };
             } catch (error) {
+                if (error.name === "AbortError") throw error;
                 failures.push(`${candidate.description}: ${error.message}`);
             }
         }
@@ -320,29 +336,35 @@
         return merged;
     }
 
-    function formatVttTimestamp(milliseconds) {
-        const total = Math.max(0, Math.round(milliseconds));
-        const hours = Math.floor(total / 3600000);
-        const minutes = Math.floor((total % 3600000) / 60000);
-        const seconds = Math.floor((total % 60000) / 1000);
-        const millis = total % 1000;
-        return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}.${String(millis).padStart(3, "0")}`;
+    function findCueIndexAtTime(cues, timeMilliseconds) {
+        let low = 0;
+        let high = cues.length - 1;
+        while (low <= high) {
+            const middle = Math.floor((low + high) / 2);
+            const cue = cues[middle];
+            if (timeMilliseconds < cue.start) {
+                high = middle - 1;
+            } else if (timeMilliseconds >= cue.end) {
+                low = middle + 1;
+            } else {
+                return middle;
+            }
+        }
+        return -1;
     }
 
-    function escapeVttText(text) {
-        return text
-            .replace(/&/g, "&amp;")
-            .replace(/</g, "&lt;")
-            .replace(/>/g, "&gt;");
-    }
+    function createSubtitleOverlay(player) {
+        const overlay = document.createElement("div");
+        overlay.className = "dual-subtitles-overlay";
+        overlay.setAttribute("aria-live", "off");
 
-    function createBilingualVtt(cues) {
-        const body = cues.map((cue, index) => [
-            String(index + 1),
-            `${formatVttTimestamp(cue.start)} --> ${formatVttTimestamp(cue.end)}`,
-            `${escapeVttText(cue.english)}\n${escapeVttText(cue.chinese)}`,
-        ].join("\n")).join("\n\n");
-        return `WEBVTT\n\n${body}\n`;
+        const englishLine = document.createElement("div");
+        englishLine.className = "dual-subtitles-line dual-subtitles-english";
+        const chineseLine = document.createElement("div");
+        chineseLine.className = "dual-subtitles-line dual-subtitles-chinese";
+        overlay.append(englishLine, chineseLine);
+        player.appendChild(overlay);
+        return { overlay, englishLine, chineseLine };
     }
 
     function ensureCaptionStyle() {
@@ -353,6 +375,49 @@
         style.textContent = `
             #movie_player.dual-subtitles-active .ytp-caption-window-container {
                 display: none !important;
+            }
+
+            #movie_player .dual-subtitles-overlay {
+                position: absolute;
+                z-index: 40;
+                left: 5%;
+                right: 5%;
+                bottom: 7%;
+                display: none;
+                pointer-events: none;
+                text-align: center;
+                color: white;
+                font-family: "YouTube Noto", Roboto, Arial, sans-serif;
+                font-size: clamp(18px, 2.7vw, 40px);
+                line-height: 1.25;
+                text-shadow:
+                    -2px -2px 2px #000,
+                    2px -2px 2px #000,
+                    -2px 2px 2px #000,
+                    2px 2px 2px #000;
+            }
+
+            #movie_player.dual-subtitles-active .dual-subtitles-overlay.dual-subtitles-has-cue {
+                display: block;
+            }
+
+            #movie_player.ytp-autohide .dual-subtitles-overlay,
+            #movie_player.ytp-fullscreen .dual-subtitles-overlay {
+                bottom: 8%;
+            }
+
+            #movie_player .dual-subtitles-line {
+                width: fit-content;
+                max-width: 100%;
+                margin: 0 auto 0.12em;
+                padding: 0.04em 0.22em;
+                background: rgb(8 8 8 / 74%);
+                white-space: pre-wrap;
+                overflow-wrap: anywhere;
+            }
+
+            #movie_player .dual-subtitles-chinese {
+                font-size: 0.92em;
             }
         `;
         document.head.appendChild(style);
@@ -386,94 +451,214 @@
         subtitlesItem.after(menuitem);
     }
 
-    async function main() {
-        cleanupCurrentVideo();
+    async function waitForPlayer(signal, maxAttempts = 30) {
+        for (let attempt = 0; attempt < maxAttempts; attempt++) {
+            throwIfAborted(signal);
+            const player = document.querySelector("#movie_player");
+            const video = player?.querySelector("video") ?? document.querySelector("video");
+            const subtitleButton = player?.querySelector(".ytp-subtitles-button");
+            const renderer = player && getCaptionRenderer(player);
+            if (player && video && subtitleButton && renderer?.captionTracks?.length) {
+                return { player, video, subtitleButton, renderer };
+            }
+            await pause(500);
+        }
+        throw new Error("YouTube player or subtitle tracks did not become ready");
+    }
+
+    function installOverlayRenderer(player, video, subtitleButton, bilingualCues) {
+        const { overlay, englishLine, chineseLine } = createSubtitleOverlay(player);
+        let currentCueIndex = -2;
+        let captionsVisible = subtitleButton.getAttribute("aria-pressed") === "true";
+        let animationFrame = null;
+
+        const render = (force = false) => {
+            const cueIndex = findCueIndexAtTime(bilingualCues, video.currentTime * 1000);
+            if (force || cueIndex !== currentCueIndex) {
+                currentCueIndex = cueIndex;
+                const cue = cueIndex >= 0 ? bilingualCues[cueIndex] : null;
+                englishLine.textContent = cue?.english ?? "";
+                chineseLine.textContent = cue?.chinese ?? "";
+            }
+            overlay.classList.toggle(
+                "dual-subtitles-has-cue",
+                captionsVisible && currentCueIndex >= 0,
+            );
+        };
+
+        const animationTick = () => {
+            render();
+            if (!video.paused && !video.ended) {
+                animationFrame = requestAnimationFrame(animationTick);
+            } else {
+                animationFrame = null;
+            }
+        };
+        const startAnimation = () => {
+            if (animationFrame === null) {
+                animationFrame = requestAnimationFrame(animationTick);
+            }
+        };
+        const stopAnimation = () => {
+            if (animationFrame !== null) {
+                cancelAnimationFrame(animationFrame);
+                animationFrame = null;
+            }
+            render(true);
+        };
+        const renderImmediately = () => render(true);
+        const setVisibility = (visible) => {
+            captionsVisible = visible;
+            player.classList.toggle("dual-subtitles-active", visible);
+            render(true);
+        };
+
+        const subtitleButtonObserver = new MutationObserver((mutations) => {
+            if (mutations.some((mutation) => mutation.attributeName === "aria-pressed")) {
+                setVisibility(subtitleButton.getAttribute("aria-pressed") === "true");
+            }
+        });
+        subtitleButtonObserver.observe(subtitleButton, {
+            attributes: true,
+            attributeFilter: ["aria-pressed"],
+        });
+
+        video.addEventListener("play", startAnimation);
+        video.addEventListener("playing", startAnimation);
+        video.addEventListener("pause", stopAnimation);
+        video.addEventListener("ended", stopAnimation);
+        video.addEventListener("seeking", renderImmediately);
+        video.addEventListener("timeupdate", render);
+
+        setVisibility(captionsVisible);
+        if (!video.paused && !video.ended) startAnimation();
+
+        return () => {
+            subtitleButtonObserver.disconnect();
+            if (animationFrame !== null) cancelAnimationFrame(animationFrame);
+            video.removeEventListener("play", startAnimation);
+            video.removeEventListener("playing", startAnimation);
+            video.removeEventListener("pause", stopAnimation);
+            video.removeEventListener("ended", stopAnimation);
+            video.removeEventListener("seeking", renderImmediately);
+            video.removeEventListener("timeupdate", render);
+            player.classList.remove("dual-subtitles-active");
+            overlay.remove();
+        };
+    }
+
+    async function addMenuItem(player, generation, english, chinese) {
+        const menuitem = document.createElement("div");
+        menuitem.className = "ytp-menuitem dual-subtitles-menuitem";
+        menuitem.setAttribute("role", "menuitem");
+        menuitem.setAttribute("tabindex", "0");
+        menuitem.innerHTML = menuItemContent("English + 中文");
+        menuitem.title = `English: ${english.description}; Chinese: ${chinese.description}`;
 
         try {
-            const player = document.querySelector("#movie_player");
-            const video = document.querySelector("video");
-            const subtitleButton = document.querySelector(".ytp-subtitles-button");
-            if (!player || !video || !subtitleButton) {
-                throw new Error("YouTube player is not ready");
+            await placeMenuItem(menuitem);
+            if (generation !== initializationGeneration || !player.isConnected) {
+                menuitem.remove();
+                return null;
             }
+            return menuitem;
+        } catch (error) {
+            menuitem.remove();
+            console.warn("Dual subtitles loaded, but the settings menu item could not be added", error);
+            return null;
+        }
+    }
 
-            const renderer = getCaptionRenderer(player);
-            if (!renderer?.captionTracks?.length) {
-                console.log("No subtitle tracks detected. Exiting.");
-                return;
-            }
+    async function main(generation, abortController, retryAttempt) {
+        try {
+            const signal = abortController.signal;
+            const { player, video, subtitleButton, renderer } = await waitForPlayer(signal);
+            throwIfAborted(signal);
 
             ensureCaptionStyle();
-            player.querySelector(".dual-subtitles-menuitem")?.remove();
-            player.querySelector(".dual-subtitle-track")?.remove();
+            document.querySelectorAll(
+                ".dual-subtitles-menuitem, .dual-subtitles-overlay, .dual-subtitle-track",
+            ).forEach((element) => element.remove());
 
-            const menuitem = document.createElement("div");
-            menuitem.className = "ytp-menuitem dual-subtitles-menuitem";
-            menuitem.setAttribute("role", "menuitem");
-            menuitem.setAttribute("tabindex", "0");
-            menuitem.innerHTML = menuItemContent("Loading...");
-            await placeMenuItem(menuitem);
-
-            const authenticatedUrl = await extractTimedTextUrl();
+            const authenticatedUrl = await extractTimedTextUrl(signal);
             const [english, chinese] = await Promise.all([
                 resolveSubtitleLanguage(
                     authenticatedUrl,
                     buildLanguageCandidates(renderer, "english"),
                     "English",
+                    signal,
                 ),
                 resolveSubtitleLanguage(
                     authenticatedUrl,
                     buildLanguageCandidates(renderer, "chinese"),
                     "Chinese",
+                    signal,
                 ),
             ]);
+            throwIfAborted(signal);
+            if (generation !== initializationGeneration) return;
 
             const bilingualCues = mergeBilingualCues(english.cues, chinese.cues);
-            const vttBlobUrl = URL.createObjectURL(new Blob(
-                [createBilingualVtt(bilingualCues)],
-                { type: "text/vtt" },
-            ));
+            if (bilingualCues.length === 0) {
+                throw new Error("No bilingual subtitle cues were produced");
+            }
 
-            const track = document.createElement("track");
-            track.className = "dual-subtitle-track";
-            track.kind = "subtitles";
-            track.label = "English + 中文";
-            track.srclang = "en";
-            track.src = vttBlobUrl;
-            video.appendChild(track);
-
-            menuitem.querySelector(".dual-subtitles-status").textContent = "English + 中文";
-            menuitem.title = `English: ${english.description}; Chinese: ${chinese.description}`;
-
-            const setTrackVisibility = (visible) => {
-                track.track.mode = visible ? "showing" : "hidden";
-                player.classList.toggle("dual-subtitles-active", visible);
-            };
-            const observer = new MutationObserver((mutations) => {
-                if (mutations.some((mutation) => mutation.attributeName === "aria-pressed")) {
-                    setTrackVisibility(subtitleButton.getAttribute("aria-pressed") === "true");
-                }
-            });
-            observer.observe(subtitleButton, {
-                attributes: true,
-                attributeFilter: ["aria-pressed"],
-            });
-
-            setTrackVisibility(subtitleButton.getAttribute("aria-pressed") === "true");
+            const removeOverlayRenderer = installOverlayRenderer(
+                player,
+                video,
+                subtitleButton,
+                bilingualCues,
+            );
+            let menuitem = null;
             cleanupCurrentVideo = () => {
-                observer.disconnect();
-                player.classList.remove("dual-subtitles-active");
-                menuitem.remove();
-                track.remove();
-                URL.revokeObjectURL(vttBlobUrl);
+                removeOverlayRenderer();
+                menuitem?.remove();
                 cleanupCurrentVideo = () => {};
             };
+
+            menuitem = await addMenuItem(player, generation, english, chinese);
+            console.log(
+                `Dual subtitles active for ${new URL(location.href).searchParams.get("v")}: `
+                + `English=${english.description}; Chinese=${chinese.description}`,
+            );
         } catch (error) {
+            if (error.name === "AbortError") return;
             console.error("Failed to load English + Chinese subtitles", error);
+            if (generation === initializationGeneration && retryAttempt < 2) {
+                scheduleMain(3000, retryAttempt + 1);
+            }
         }
     }
 
-    document.addEventListener("yt-navigate-finish", () => {
-        setTimeout(main, 5000);
+    function scheduleMain(delay = 1500, retryAttempt = 0) {
+        if (initializationTimer !== null) clearTimeout(initializationTimer);
+        initializationTimer = null;
+        initializationGeneration++;
+        const generation = initializationGeneration;
+
+        activeAbortController?.abort();
+        activeAbortController = new AbortController();
+        cleanupCurrentVideo();
+
+        initializationTimer = setTimeout(() => {
+            initializationTimer = null;
+            main(generation, activeAbortController, retryAttempt);
+        }, delay);
+    }
+
+    document.addEventListener("yt-navigate-start", () => {
+        if (initializationTimer !== null) clearTimeout(initializationTimer);
+        initializationGeneration++;
+        activeAbortController?.abort();
+        cleanupCurrentVideo();
     });
+    document.addEventListener("yt-navigate-finish", () => scheduleMain());
+
+    // The initial yt-navigate-finish event can fire before a document-idle
+    // userscript is installed, so always initialize the current page too.
+    if (document.readyState === "loading") {
+        document.addEventListener("DOMContentLoaded", () => scheduleMain(), { once: true });
+    } else {
+        scheduleMain();
+    }
 })();
