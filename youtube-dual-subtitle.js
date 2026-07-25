@@ -18,6 +18,8 @@
 // @updateURL https://update.greasyfork.org/scripts/464879/Youtube%20%E5%8F%8C%E8%AF%AD%E5%AD%97%E5%B9%95%E5%85%A8%E5%B9%B3%E5%8F%B0.meta.js
 // ==/UserScript==
 
+// not works well
+
 /*
 如果未自动加载，请切换字幕或关闭后再打开即可。默认语言为浏览器首选语言。
 */
