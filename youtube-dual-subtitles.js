@@ -90,70 +90,39 @@
             ?? track.languageCode;
     }
 
-    function findTimedTextUrl(videoId) {
-        const entries = performance.getEntriesByType("resource").slice().reverse();
-        for (const entry of entries) {
-            if (!entry.name.includes("timedtext")) continue;
-
-            const url = new URL(entry.name);
-            if (!url.searchParams.has("pot")) continue;
-            if (videoId && url.searchParams.get("v") !== videoId) continue;
-            return url;
-        }
-        return null;
-    }
-
-    async function setSubtitleButtonState(subtitleButton, enabled, signal) {
-        const expectedValue = enabled ? "true" : "false";
-        if (subtitleButton.getAttribute("aria-pressed") === expectedValue) return;
-
-        subtitleButton.click();
-        for (let attempt = 0; attempt < 20; attempt++) {
-            await pause(100);
-            throwIfAborted(signal);
-            if (subtitleButton.getAttribute("aria-pressed") === expectedValue) return;
-        }
-        throw new Error(`Subtitle button did not change to aria-pressed=${expectedValue}`);
-    }
-
     // Returns a recent timedtext request containing the PO token. YouTube's
     // caption-track baseUrl is still used for the actual track selection.
-    async function extractTimedTextUrl(signal, maxRetries = 3) {
+    async function extractTimedTextUrl(signal, maxRetries = 5) {
         const subtitleButton = document.querySelector(".ytp-subtitles-button");
         if (!subtitleButton) {
             throw new Error("Subtitle button not found");
         }
 
         const videoId = new URL(location.href).searchParams.get("v");
-        const existingUrl = findTimedTextUrl(videoId);
-        if (existingUrl) {
-            console.log("Found an existing timedtext request with a PO token");
-            return existingUrl;
-        }
-
-        const captionsInitiallyEnabled = subtitleButton.getAttribute("aria-pressed") === "true";
-        for (let attempt = 0; attempt < maxRetries; attempt++) {
+        let retries = maxRetries;
+        while (retries > 0) {
             throwIfAborted(signal);
-            console.log(`Trying to trigger a timedtext request. Try ${attempt + 1}/${maxRetries}`);
+            console.log(`Trying to find timedtext URL. Try ${maxRetries - retries + 1}/${maxRetries}`);
 
-            try {
-                // YouTube may debounce consecutive clicks in Firefox. Wait for
-                // each aria-pressed transition before restoring the original state.
-                await setSubtitleButtonState(subtitleButton, !captionsInitiallyEnabled, signal);
-                await pause(250);
-                await setSubtitleButtonState(subtitleButton, captionsInitiallyEnabled, signal);
-                await pause(750);
-            } finally {
-                if (!signal.aborted) {
-                    await setSubtitleButtonState(subtitleButton, captionsInitiallyEnabled, signal);
-                }
-            }
+            // Toggling twice preserves the current state and triggers a caption request.
+            subtitleButton.click();
+            subtitleButton.click();
+            await pause(500);
+            throwIfAborted(signal);
 
-            const url = findTimedTextUrl(videoId);
-            if (url) {
+            const entries = performance.getEntriesByType("resource").slice().reverse();
+            for (const entry of entries) {
+                if (!entry.name.includes("timedtext")) continue;
+
+                const url = new URL(entry.name);
+                if (!url.searchParams.has("pot")) continue;
+                if (videoId && url.searchParams.get("v") !== videoId) continue;
+
                 console.log("Found matching timedtext request with a PO token");
                 return url;
             }
+
+            retries--;
         }
 
         console.warn("No timedtext request with a PO token was found; trying track baseUrls directly");
