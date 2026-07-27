@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube Dual Subtitles
 // @namespace    http://tampermonkey.net/
-// @version      1.2
+// @version      1.3
 // @description  Show English and Chinese subtitles together on YouTube
 // @author       Vinh Nguyen
 // @match        https://www.youtube.com/watch*
@@ -17,8 +17,18 @@
         english: "en",
         chinese: "zh-Hans",
     };
+    const CAPTION_DISPLAY_SETTINGS_KEY = "yt-player-caption-display-settings";
+    const CAPTION_FONT_SCALES = new Map([
+        [-2, 0.5],
+        [-1, 0.75],
+        [0, 1],
+        [1, 1.5],
+        [2, 2],
+        [3, 3],
+        [4, 4],
+    ]);
 
-    let cleanupCurrentVideo = () => {};
+    let cleanupCurrentVideo = () => { };
     let initializationTimer = null;
     let initializationGeneration = 0;
     let activeAbortController = null;
@@ -398,6 +408,84 @@
         return { overlay, englishLine, chineseLine };
     }
 
+    function finiteNumber(value) {
+        if (value === null || value === undefined || value === "") return null;
+        const number = Number(value);
+        return Number.isFinite(number) ? number : null;
+    }
+
+    function parseStoredCaptionFontSize(rawValue) {
+        if (!rawValue) return null;
+
+        try {
+            let settings = JSON.parse(rawValue);
+            if (typeof settings?.data === "string") {
+                settings = JSON.parse(settings.data);
+            } else if (settings?.data && typeof settings.data === "object") {
+                settings = settings.data;
+            }
+            return finiteNumber(settings?.fontSizeIncrement);
+        } catch {
+            return null;
+        }
+    }
+
+    function getYouTubeCaptionFontSize(player) {
+        try {
+            const playerFontSize = finiteNumber(player.getOption?.("captions", "fontSize"));
+            if (playerFontSize !== null) return playerFontSize;
+        } catch {
+            // The captions module may not expose getOption on every player build.
+        }
+
+        try {
+            return parseStoredCaptionFontSize(
+                localStorage.getItem(CAPTION_DISPLAY_SETTINGS_KEY),
+            ) ?? 0;
+        } catch {
+            return 0;
+        }
+    }
+
+    function captionFontScale(fontSizeIncrement) {
+        const normalizedIncrement = Math.round(fontSizeIncrement);
+        if (CAPTION_FONT_SCALES.has(normalizedIncrement)) {
+            return CAPTION_FONT_SCALES.get(normalizedIncrement);
+        }
+        return normalizedIncrement < 0 ? CAPTION_FONT_SCALES.get(-2) : CAPTION_FONT_SCALES.get(4);
+    }
+
+    function captionFontSizeValue(scale) {
+        const minimum = Number((18 * scale).toFixed(2));
+        const preferred = Number((2.7 * scale).toFixed(3));
+        const maximum = Number((40 * scale).toFixed(2));
+        return `clamp(${minimum}px, ${preferred}vw, ${maximum}px)`;
+    }
+
+    function installCaptionFontSizeSync(player, overlay) {
+        let appliedFontSize = null;
+        const syncFontSize = () => {
+            const scale = captionFontScale(getYouTubeCaptionFontSize(player));
+            const fontSize = captionFontSizeValue(scale);
+            if (fontSize === appliedFontSize) return;
+
+            appliedFontSize = fontSize;
+            overlay.style.setProperty("--dual-subtitles-font-size", fontSize);
+        };
+        const handleStorageChange = (event) => {
+            if (event.key === CAPTION_DISPLAY_SETTINGS_KEY) syncFontSize();
+        };
+
+        syncFontSize();
+        const syncTimer = setInterval(syncFontSize, 500);
+        window.addEventListener("storage", handleStorageChange);
+
+        return () => {
+            clearInterval(syncTimer);
+            window.removeEventListener("storage", handleStorageChange);
+        };
+    }
+
     function ensureCaptionStyle() {
         if (document.querySelector("#dual-subtitles-style")) return;
 
@@ -419,7 +507,7 @@
                 text-align: center;
                 color: white;
                 font-family: "YouTube Noto", Roboto, Arial, sans-serif;
-                font-size: clamp(18px, 2.7vw, 40px);
+                font-size: var(--dual-subtitles-font-size, clamp(18px, 2.7vw, 40px));
                 line-height: 1.25;
                 text-shadow:
                     -2px -2px 2px #000,
@@ -499,6 +587,7 @@
 
     function installOverlayRenderer(player, video, subtitleButton, bilingualCues) {
         const { overlay, englishLine, chineseLine } = createSubtitleOverlay(player);
+        const removeCaptionFontSizeSync = installCaptionFontSizeSync(player, overlay);
         let currentCueIndex = -2;
         let captionsVisible = subtitleButton.getAttribute("aria-pressed") === "true";
         let animationFrame = null;
@@ -565,6 +654,7 @@
         if (!video.paused && !video.ended) startAnimation();
 
         return () => {
+            removeCaptionFontSizeSync();
             subtitleButtonObserver.disconnect();
             if (animationFrame !== null) cancelAnimationFrame(animationFrame);
             video.removeEventListener("play", startAnimation);
@@ -644,7 +734,7 @@
             cleanupCurrentVideo = () => {
                 removeOverlayRenderer();
                 menuitem?.remove();
-                cleanupCurrentVideo = () => {};
+                cleanupCurrentVideo = () => { };
             };
 
             menuitem = await addMenuItem(player, generation, english, chinese);
