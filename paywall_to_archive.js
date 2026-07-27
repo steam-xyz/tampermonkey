@@ -46,7 +46,7 @@
 // @updateURL https://update.greasyfork.org/scripts/566424/Paywall%20to%20Archive%20%28Universal%29.meta.js
 // ==/UserScript==
 
-(function() {
+(function () {
     'use strict';
 
     // 网站配置 - 可以为特定网站自定义按钮文本
@@ -97,19 +97,19 @@
     });
 
     // 鼠标悬停效果
-    btn.onmouseover = function() {
+    btn.onmouseover = function () {
         btn.style.opacity = '1';
         btn.style.transform = 'scale(1.05)';
         btn.style.boxShadow = '0 6px 16px rgba(0,0,0,0.4)';
     };
-    btn.onmouseout = function() {
+    btn.onmouseout = function () {
         btn.style.opacity = '0.85';
         btn.style.transform = 'scale(1)';
         btn.style.boxShadow = '0 4px 12px rgba(0,0,0,0.3)';
     };
 
     // 点击事件
-    btn.onclick = function() {
+    btn.onclick = function () {
         // 清理URL参数和锚点
         let url = window.location.href;
         url = url.split('?')[0];  // 移除查询参数
@@ -142,7 +142,7 @@
     }
 
     // 键盘快捷键 (可选)：按 Alt+A 快速跳转
-    document.addEventListener('keydown', function(e) {
+    document.addEventListener('keydown', function (e) {
         if (e.altKey && e.key === 'a') {
             e.preventDefault();
             btn.click();

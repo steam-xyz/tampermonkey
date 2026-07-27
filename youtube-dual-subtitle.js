@@ -81,7 +81,7 @@
             for (const defaultJsonEvent of defaultSubtitles.events) {
               if (!defaultJsonEvent.segs) continue;
               let currentStart = defaultJsonEvent.tStartMs,
-                  currentEnd = currentStart + defaultJsonEvent.dDurationMs;
+                currentEnd = currentStart + defaultJsonEvent.dDurationMs;
               let currentLocalEvents = pureLocalEvents.filter(pe => currentStart <= pe.tStartMs && pe.tStartMs < currentEnd);
               let localLine = '';
               for (const ev of currentLocalEvents) {
